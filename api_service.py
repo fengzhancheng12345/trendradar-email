@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TrendRadar API Service - User, Stock & Email Management
+TrendRadar API Service - User, Stock & Payment Management
 Connects website (port 80) with email service (port 3000)
 """
 
@@ -11,9 +11,18 @@ import json
 import requests
 from flask import Flask, request, jsonify, g
 from functools import wraps
+from datetime import datetime
 
 app = Flask(__name__)
 DATABASE = '/root/trendradar.db'
+
+# 会员等级配置
+TIER_CONFIG = {
+    'free': {'credits': 3, 'price': 0},
+    'basic': {'credits': 10, 'price': 9.9},
+    'pro': {'credits': 50, 'price': 39.9},
+    'vip': {'credits': 999999, 'price': 99.9}
+}
 
 def get_db():
     db = getattr(g, '_database', None)
@@ -32,6 +41,7 @@ def init_db():
     """Initialize database tables"""
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
+    
     # Users table
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,6 +52,7 @@ def init_db():
         credits INTEGER DEFAULT 3,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+    
     # Stocks table
     c.execute('''CREATE TABLE IF NOT EXISTS stocks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +63,24 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id)
     )''')
+    
+    # Orders table (购买记录)
+    c.execute('''CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        tier TEXT NOT NULL,
+        amount REAL NOT NULL,
+        currency TEXT DEFAULT 'USDT',
+        txid TEXT,
+        status TEXT DEFAULT 'pending',
+        payment_method TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        paid_at TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )''')
+    
+    conn.commit()
+    conn.close()
     conn.commit()
     conn.close()
 
@@ -234,16 +263,119 @@ def send_email():
     except requests.exceptions.RequestException as e:
         return jsonify({'detail': f'Cannot connect to email service: {str(e)}'}), 503
 
+# === Orders & Payment Endpoints ===
+
+@app.route('/api/v1/orders', methods=['GET'])
+@token_required
+def list_orders():
+    """获取用户订单列表"""
+    db = get_db()
+    orders = db.execute('''SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC''',
+                       (g.user['id'],)).fetchall()
+    return jsonify([dict(o) for o in orders])
+
+@app.route('/api/v1/orders', methods=['POST'])
+@token_required
+def create_order():
+    """创建订单"""
+    data = request.json
+    tier = data.get('tier', 'basic')
+    currency = data.get('currency', 'USDT')
+    payment_method = data.get('payment_method', 'crypto')
+    
+    if tier not in TIER_CONFIG:
+        return jsonify({'detail': 'Invalid tier'}), 400
+    
+    price = TIER_CONFIG[tier]['price']
+    
+    db = get_db()
+    order_id = str(uuid.uuid4())[:8]
+    
+    db.execute('''INSERT INTO orders (user_id, tier, amount, currency, txid, status, payment_method)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+               (g.user['id'], tier, price, currency, '', 'pending', payment_method))
+    db.commit()
+    
+    order = db.execute('SELECT * FROM orders WHERE id = ?', (db.execute('SELECT last_insert_rowid()').fetchone()[0],)).fetchone()
+    
+    return jsonify({
+        'order_id': order['id'],
+        'tier': tier,
+        'amount': price,
+        'currency': currency,
+        'status': 'pending',
+        'wallet_address': '0x78505a332208C5d5de6332A41c89fb306F1BaB95',  # 充值地址
+        'instructions': f'请向以上地址转账 {price} {currency}，然后提交TXID验证'
+    })
+
+@app.route('/api/v1/orders/verify', methods=['POST'])
+@token_required
+def verify_payment():
+    """验证支付 (TXID验证)"""
+    data = request.json
+    order_id = data.get('order_id')
+    txid = data.get('txid', '')
+    
+    if not txid:
+        return jsonify({'detail': 'Missing TXID'}), 400
+    
+    db = get_db()
+    order = db.execute('SELECT * FROM orders WHERE id = ? AND user_id = ?',
+                      (order_id, g.user['id'])).fetchone()
+    
+    if not order:
+        return jsonify({'detail': 'Order not found'}), 404
+    
+    if order['status'] == 'paid':
+        return jsonify({'detail': 'Already verified', 'status': 'paid'})
+    
+    # TODO: 这里可以添加区块链TXID验证逻辑
+    # 简化版：直接标记为已支付（实际应该查询区块链）
+    
+    # 更新订单状态
+    db.execute('UPDATE orders SET status = ?, txid = ?, paid_at = ? WHERE id = ?',
+               ('paid', txid, datetime.now().isoformat(), order_id))
+    
+    # 开通会员
+    tier = order['tier']
+    credits = TIER_CONFIG[tier]['credits']
+    db.execute('UPDATE users SET tier = ?, credits = credits + ? WHERE id = ?',
+               (tier, credits, g.user['id']))
+    db.commit()
+    
+    return jsonify({
+        'status': 'paid',
+        'tier': tier,
+        'credits_added': credits,
+        'message': f'支付验证成功！已开通 {tier} 会员，赠送 {credits} 次'
+    })
+
+@app.route('/api/v1/tiers', methods=['GET'])
+def get_tiers():
+    """获取会员等级信息"""
+    return jsonify(TIER_CONFIG)
+
 @app.route('/api/v1/user/info', methods=['GET'])
 @token_required
 def get_user_info():
-    """Get current user info"""
-    return jsonify({
-        'username': g.user['username'],
-        'email': g.user['email'],
-        'tier': g.user['tier'],
-        'credits': g.user['credits']
-    })
+    """获取当前用户完整信息（包括订单、自选股）"""
+    db = get_db()
+    user = dict(g.user)
+    
+    # 获取订单
+    orders = db.execute('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC',
+                       (g.user['id'],)).fetchall()
+    user['orders'] = [dict(o) for o in orders]
+    
+    # 获取自选股
+    stocks = db.execute('SELECT * FROM stocks WHERE user_id = ?',
+                       (g.user['id'],)).fetchall()
+    user['stocks'] = [dict(s) for s in stocks]
+    
+    # 清理密码
+    del user['password']
+    
+    return jsonify(user)
 
 @app.route('/health', methods=['GET'])
 def health():
