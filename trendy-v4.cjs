@@ -1,6 +1,7 @@
 // TrendRadar Pro - Fixed Market Data
 const http = require('http');
 const https = require('https');
+const url = require('url');
 const { Client } = require('ssh2');
 
 const MINIMAX_API_KEY = 'sk-cp-n5IDb5UH8hjF_l5Ac7YAtHTbBEmtTzFLPC9Xv-hEf1aWvU7gg914UFaamdAbkC35xCYyWUgpTfnmRC8PLV5zwUkT0l7DWHOkWrg3qEQsrpiiR4s4Y6WBraw';
@@ -305,8 +306,6 @@ async function runAnalysis(customCodes = null) {
 }
 
 // HTTP Server for API calls
-const http = require('http');
-const url = require('url');
 
 async function handleRequest(req, res) {
     res.setHeader('Content-Type', 'application/json');
